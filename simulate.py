@@ -706,9 +706,16 @@ def build_svg(times, cfg):
     bucket_width = int(cfg.get("bucket_width", 20))
     num_sim_runs = int(cfg.get("num_sim_runs", 200))
     simulated_posts = int(cfg.get("simulated_posts", 528))
-    marker_start = parse_window_date(cfg.get("window_start", "2026-07-13"), end_of_day=False)
-    marker_end = parse_window_date(cfg.get("window_end", "2026-07-15"), end_of_day=True)
-
+    marker_start = parse_window_datetime(
+        cfg.get("window_start", "2026-07-13"),
+        hour=int(cfg.get("window_start_hour", 12)),
+        minute=int(cfg.get("window_start_minute", 0)),
+    )
+    marker_end = parse_window_datetime(
+        cfg.get("window_end", "2026-07-15"),
+        hour=int(cfg.get("window_end_hour", 12)),
+        minute=int(cfg.get("window_end_minute", 0)),
+    )
     clusters = build_clusters(times, gap_minutes)
     total_tweets = len(times)
 
