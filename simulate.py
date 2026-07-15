@@ -691,12 +691,11 @@ def svg_cumulative_panel(x, y, w, h, actual_times, actual_counts, sim_times, sim
 # Assembly + entrypoint
 # ---------------------------------------------------------------------------
 
-def parse_window_date(date_str, end_of_day=False):
-    """Parse 'YYYY-MM-DD' as a US-Eastern local date and return an aware
-    UTC datetime at 00:00:00 (or 23:59:59 if end_of_day) Eastern."""
+def parse_window_datetime(date_str, hour=12, minute=0):
+    """Parse 'YYYY-MM-DD' as a US-Eastern local date at the given hour:minute
+    (default noon ET) and return an aware UTC datetime."""
     d = datetime.strptime(date_str.strip(), "%Y-%m-%d")
-    if end_of_day:
-        d = d.replace(hour=23, minute=59, second=59)
+    d = d.replace(hour=hour, minute=minute, second=0)
     d_eastern = d.replace(tzinfo=EASTERN)
     return d_eastern.astimezone(timezone.utc)
 
