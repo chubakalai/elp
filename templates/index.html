@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MuskMeter</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 0; padding: 20px; background: #fafafa; color: #222; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: #777; font-size: 13px; margin-bottom: 20px; }
+  .layout { display: flex; gap: 24px; align-items: flex-start; flex-wrap: wrap; }
+  .panel { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 16px; }
+  .svg-panel { flex: 1 1 600px; min-width: 320px; overflow-x: auto; }
+  .svg-panel img { width: 100%; height: auto; display: block; }
+  .config-panel { flex: 0 0 320px; }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+  .field input[type="text"], .field input[type="number"] {
+    width: 100%; box-sizing: border-box; padding: 6px 8px; font-size: 14px;
+    border: 1px solid #ccc; border-radius: 4px;
+  }
+  .checkbox-field { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .checkbox-field label { font-size: 13px; font-weight: 600; margin: 0; }
+  .row2 { display: flex; gap: 10px; }
+  .row2 .field { flex: 1; }
+  button {
+    width: 100%; padding: 10px; font-size: 14px; font-weight: 600;
+    background: #222; color: white; border: none; border-radius: 6px; cursor: pointer;
+  }
+  button:hover { background: #444; }
+  .status-line { font-size: 12px; color: #999; margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<h1>MuskMeter</h1>
+<div class="sub">Cluster analysis &amp; probability simulation, auto-refreshing</div>
+
+<div class="layout">
+
+  <div class="panel svg-panel">
+    {% if svg_available %}
+      <img id="svg-img" src="{{ url_for('svg') }}?t={{ svg_mtime }}" alt="Cluster analysis">
+    {% else %}
+      <p>No chart generated yet. The simulator runs every minute -- check back shortly.</p>
+    {% endif %}
+    <div class="status-line" id="status-line">last updated: {{ svg_mtime or "never" }}</div>
+  </div>
+
+  <div class="panel config-panel">
+    <form method="post" action="{{ url_for('update_config') }}">
+
+      <div class="checkbox-field">
+        <input type="checkbox" id="notify_every_post" name="notify_every_post" {% if cfg.notify_every_post %}checked{% endif %}>
+        <label for="notify_every_post">Notify on every post</label>
+      </div>
+      <div class="checkbox-field">
+        <input type="checkbox" id="notify_bucket_change" name="notify_bucket_change" {% if cfg.notify_bucket_change %}checked{% endif %}>
+        <label for="notify_bucket_change">Notify on bucket change</label>
+      </div>
+      <div class="checkbox-field">
+        <input type="checkbox" id="notify_on_start_stop" name="notify_on_start_stop" {% if cfg.notify_on_start_stop %}checked{% endif %}>
+        <label for="notify_on_start_stop">Notify on start/stop</label>
+      </div>
+
+      <div class="row2">
+        <div class="field">
+          <label for="window_start">Window start</label>
+          <input type="text" id="window_start" name="window_start" value="{{ cfg.window_start }}" placeholder="YYYY-MM-DD">
+        </div>
+        <div class="field">
+          <label for="window_end">Window end</label>
+          <input type="text" id="window_end" name="window_end" value="{{ cfg.window_end }}" placeholder="YYYY-MM-DD">
+        </div>
+      </div>
+
+      <div class="row2">
+        <div class="field">
+          <label for="bucket_width">Bucket width</label>
+          <input type="number" id="bucket_width" name="bucket_width" value="{{ cfg.bucket_width }}">
+        </div>
+        <div class="field">
+          <label for="num_sim_runs">Sim runs</label>
+          <input type="number" id="num_sim_runs" name="num_sim_runs" value="{{ cfg.num_sim_runs }}">
+        </div>
+      </div>
+
+      <div class="row2">
+        <div class="field">
+          <label for="simulated_posts">Simulated posts</label>
+          <input type="number" id="simulated_posts" name="simulated_posts" value="{{ cfg.simulated_posts }}">
+        </div>
+        <div class="field">
+          <label for="cluster_gap_minutes">Cluster gap (min)</label>
+          <input type="text" id="cluster_gap_minutes" name="cluster_gap_minutes" value="{{ cfg.cluster_gap_minutes }}">
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="recency_exponent">Recency exponent</label>
+        <input type="text" id="recency_exponent" name="recency_exponent" value="{{ cfg.recency_exponent }}">
+      </div>
+
+      <div class="row2">
+        <div class="field">
+          <label for="poll_min_interval">Poll min (s)</label>
+          <input type="number" id="poll_min_interval" name="poll_min_interval" value="{{ cfg.poll_min_interval }}">
+        </div>
+        <div class="field">
+          <label for="poll_max_interval">Poll max (s)</label>
+          <input type="number" id="poll_max_interval" name="poll_max_interval" value="{{ cfg.poll_max_interval }}">
+        </div>
+      </div>
+
+      <div class="row2">
+        <div class="field">
+          <label for="poll_start_interval">Poll start (s)</label>
+          <input type="number" id="poll_start_interval" name="poll_start_interval" value="{{ cfg.poll_start_interval }}">
+        </div>
+        <div class="field">
+          <label for="sim_interval_seconds">Sim loop (s)</label>
+          <input type="number" id="sim_interval_seconds" name="sim_interval_seconds" value="{{ cfg.sim_interval_seconds }}">
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="ntfy_topic">ntfy topic</label>
+        <input type="text" id="ntfy_topic" name="ntfy_topic" value="{{ cfg.ntfy_topic }}">
+      </div>
+
+      <button type="submit">Save configuration</button>
+    </form>
+  </div>
+
+</div>
+
+<script>
+  // Poll /status every 10s; if the SVG's mtime changed, swap the <img> src
+  // with a cache-busting query param so the browser actually refetches it.
+  let lastMtime = {{ (svg_mtime or 0) | tojson }};
+
+  async function poll() {
+    try {
+      const res = await fetch("{{ url_for('status') }}");
+      const data = await res.json();
+      if (data.svg_mtime && data.svg_mtime !== lastMtime) {
+        lastMtime = data.svg_mtime;
+        const img = document.getElementById("svg-img");
+        if (img) {
+          img.src = "{{ url_for('svg') }}?t=" + lastMtime;
+        } else {
+          location.reload();
+        }
+        document.getElementById("status-line").textContent = "last updated: " + lastMtime;
+      }
+    } catch (e) {
+      // ignore transient network errors, try again next tick
+    }
+  }
+
+  setInterval(poll, 10000);
+</script>
+
+</body>
+</html>
