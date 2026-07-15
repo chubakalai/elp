@@ -31,6 +31,10 @@ DEFAULTS = {
     "poll_start_interval": 5,
     "ntfy_topic": "chan6667",
     "sim_interval_seconds": 60,
+    "window_start_hour": 12,
+    "window_start_minute": 0,
+    "window_end_hour": 12,
+    "window_end_minute": 0,
 }
 
 _lock = threading.Lock()
