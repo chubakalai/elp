@@ -1,0 +1,17 @@
+{
+  "notify_every_post": true,
+  "notify_bucket_change": true,
+  "notify_on_start_stop": true,
+  "window_start": "2026-07-13",
+  "window_end": "2026-07-15",
+  "bucket_width": 20,
+  "num_sim_runs": 200,
+  "simulated_posts": 528,
+  "cluster_gap_minutes": 45.0,
+  "recency_exponent": -0.0769230769,
+  "poll_min_interval": 3,
+  "poll_max_interval": 60,
+  "poll_start_interval": 5,
+  "ntfy_topic": "chan6667",
+  "sim_interval_seconds": 60
+}
