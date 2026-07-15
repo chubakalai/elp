@@ -28,8 +28,7 @@ NTFY_BASE = "https://ntfy.sh"
 MUSKMETER_URL = "https://www.muskmeter.live/"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-EST_OFFSET = timedelta(hours=-4)  # EDT = UTC-4; adjust if standard time matters to you
-
+from zoneinfo import ZoneInfo
 
 def send_ntfy_notification(topic, message, title="New Post Detected!", priority=3):
     if not topic:
@@ -78,8 +77,15 @@ def utc_now_str():
     return utc_now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+
+
+EASTERN = ZoneInfo("America/New_York")
+
+
 def to_est(dt_utc):
-    return dt_utc + EST_OFFSET
+    """Convert an aware UTC datetime to US-Eastern, correctly handling the
+    EST/EDT transition (unlike a fixed offset)."""
+    return dt_utc.astimezone(EASTERN)
 
 
 def format_datetime_est_from_utc(dt_utc):
