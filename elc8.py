@@ -20,7 +20,7 @@ import re
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 from config_store import load_config
@@ -33,6 +33,9 @@ TARGET_USER = "elonmusk"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
 TIMEOUT_SECONDS = 15
+
+# Launch time in EST (when the collector was first deployed)
+LAUNCH_TIME_EST = datetime(2024, 1, 1, 0, 0, 0, tzinfo=EASTERN)  # Adjust this to actual launch date
 
 # Fixed 2-source rotation, staggered at :00 :30 within each 60s cycle.
 SOURCES = [
@@ -60,6 +63,11 @@ def utc_now():
     return datetime.now(timezone.utc)
 
 
+def est_now():
+    """Return current time in EST."""
+    return datetime.now(EASTERN)
+
+
 def log(action, outcome, detail=""):
     ts = utc_now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {action}: {outcome}"
@@ -72,13 +80,13 @@ def to_est(dt_utc):
     return dt_utc.astimezone(EASTERN)
 
 
-def format_datetime_est_from_utc(dt_utc):
-    if dt_utc is None:
+def format_datetime_est(dt_est):
+    """Format an EST datetime into display strings."""
+    if dt_est is None:
         return "", "", ""
-    est_dt = to_est(dt_utc)
-    at_str = est_dt.strftime("%-m/%-d/%Y, %-I:%M:%S %p")
-    date_str = est_dt.strftime("%-m/%-d/%Y")
-    time_str = est_dt.strftime("%-I:%M:%S %p")
+    at_str = dt_est.strftime("%-m/%-d/%Y, %-I:%M:%S %p")
+    date_str = dt_est.strftime("%-m/%-d/%Y")
+    time_str = dt_est.strftime("%-I:%M:%S %p")
     return at_str, date_str, time_str
 
 
@@ -156,6 +164,7 @@ def _strip_tags(html_fragment):
 
 
 def _parse_nitter_absolute_timestamp(title_str):
+    """Parse Nitter's UTC timestamp string to UTC datetime."""
     cleaned = re.sub(r'\s+', ' ', title_str.replace("\u00b7", "").strip())
     try:
         return datetime.strptime(cleaned, "%b %d, %Y %I:%M %p UTC").replace(tzinfo=timezone.utc)
@@ -184,12 +193,14 @@ def extract_tweets_nitter(html_content, target_user=TARGET_USER):
             content = _strip_tags(content_match.group(1))
 
         date_match = NITTER_DATE_TITLE_RE.search(item_html)
-        posted_datetime = _parse_nitter_absolute_timestamp(date_match.group(1)) if date_match else None
+        posted_datetime_utc = _parse_nitter_absolute_timestamp(date_match.group(1)) if date_match else None
 
         tweets.append({
-            "id": tweet_id, "content": content,
+            "id": tweet_id, 
+            "content": content,
             "type": "retweet" if is_retweet else "direct",
-            "posted_datetime": posted_datetime,
+            "posted_datetime_utc": posted_datetime_utc,  # Original post time (UTC)
+            "is_retweet": is_retweet,
         })
     return tweets
 
@@ -213,11 +224,33 @@ def load_seen_ids():
     return {row[0] for row in rows if row}
 
 
+def is_valid_post(posted_datetime_est, parsing_time_est):
+    """Check if post should be included:
+    - Must be after launch time
+    - Must not be older than 10 minutes from parsing time
+    - For retweets: we use parsing time, so they're always within 10 min window
+    - For direct posts: check original timestamp is within 10 min
+    """
+    if posted_datetime_est < LAUNCH_TIME_EST:
+        return False
+    
+    # Check if post is older than 10 minutes
+    age = parsing_time_est - posted_datetime_est
+    if age > timedelta(minutes=10):
+        return False
+    
+    return True
+
+
 def process_fetch_result(source_id, html_text, seen_tweet_ids, cfg):
     tweets, parseable = parse_nitter(html_text)
     if not parseable:
         return None
 
+    # Record the parsing time in EST (this is the time we discovered the post)
+    parsing_time_est = est_now()
+
+    # Filter out already seen tweets
     new_posts = [t for t in tweets if t["id"] not in seen_tweet_ids]
     if not new_posts:
         return 0
@@ -235,39 +268,69 @@ def process_fetch_result(source_id, html_text, seen_tweet_ids, cfg):
     if not new_posts:
         return 0
 
-    for t in new_posts:
-        seen_tweet_ids.add(t["id"])
-
-    now_utc = utc_now()
-    imported_at, imported_date, imported_time = format_datetime_est_from_utc(now_utc)
-
     rows_to_append = []
+    valid_new_posts = []
+    
     for t in new_posts:
-        posted_at, posted_date, posted_time = format_datetime_est_from_utc(t["posted_datetime"])
+        # Determine the effective posted datetime in EST
+        if t["is_retweet"]:
+            # For retweets: use the parsing time as the posted time
+            # because the original timestamp is when the original post was made,
+            # not when Elon retweeted it
+            effective_posted_est = parsing_time_est
+            log("post.process", "retweet_adjusted", 
+                f"id={t['id']} using_parse_time={effective_posted_est.strftime('%m/%d/%Y %I:%M:%S %p')}")
+        else:
+            # For direct posts: convert original UTC timestamp to EST
+            if t["posted_datetime_utc"]:
+                effective_posted_est = to_est(t["posted_datetime_utc"])
+            else:
+                log("post.process", "skip_no_timestamp", f"id={t['id']}")
+                continue
+        
+        # Check if post passes validation
+        if not is_valid_post(effective_posted_est, parsing_time_est):
+            log("post.process", "skip_out_of_window", 
+                f"id={t['id']} type={t['type']} posted={effective_posted_est.strftime('%m/%d/%Y %I:%M:%S %p')}")
+            continue
+        
+        valid_new_posts.append(t)
+        
+        # Format the EST datetime for CSV
+        posted_at, posted_date, posted_time = format_datetime_est(effective_posted_est)
+        imported_at, imported_date, imported_time = format_datetime_est(parsing_time_est)
+        
         rows_to_append.append([
             t["id"], "elonmusk", t["content"],
             posted_at, posted_date, posted_time,
             imported_at, imported_date, imported_time,
         ])
 
+    if not valid_new_posts:
+        return 0
+
+    # Mark these posts as seen
+    for t in valid_new_posts:
+        seen_tweet_ids.add(t["id"])
+
     try:
         append_csv_rows(rows_to_append, commit_message=f"elc8 ({source_id}): +{len(rows_to_append)} post(s)")
         log("github.append_csv", "ok", f"source={source_id} rows={len(rows_to_append)}")
     except RuntimeError as e:
         log("github.append_csv", "error", str(e))
-        for t in new_posts:
+        for t in valid_new_posts:
             seen_tweet_ids.discard(t["id"])
         return None
 
     if cfg.get("notify_every_post", True):
         ntfy_topic = cfg.get("ntfy_topic", "chan6667")
-        for t in new_posts[:2]:
+        for t in valid_new_posts[:2]:
             msg = f"{t['type']} post (via {source_id})"
             if t["content"]:
                 msg += f"\n{t['content'][:200]}"
             send_ntfy_notification(ntfy_topic, msg, "Elon Musk post", priority=3)
 
-    return len(new_posts)
+    return len(valid_new_posts)
 
 
 def _sleep_interruptible(seconds, stop_event):
@@ -289,6 +352,7 @@ def run_collector(stop_event=None):
 
     seen_tweet_ids = load_seen_ids()
     log("collector.start", "ok", f"known_ids={len(seen_tweet_ids)}")
+    log("collector.config", "launch_time", f"{LAUNCH_TIME_EST.strftime('%m/%d/%Y %I:%M:%S %p')} EST")
 
     if cfg.get("notify_on_start_stop", True):
         send_ntfy_notification(ntfy_topic, "elc8 collector started", "Collector Started", priority=2)
