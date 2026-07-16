@@ -1,12 +1,32 @@
 #!/usr/bin/env python3
 """
-Collector: polls muskmeter.live, extracts new posts, appends them to the
-CSV stored in the GitHub repo (via github_store.py), and optionally sends
-ntfy notifications. Prints a short success message on every successful
-fetch of muskmeter.live.
+Collector: polls a rotating pool of sources (muskmeter.live + Nitter
+instances) for elonmusk's posts, appends new posts to the CSV stored in
+the GitHub repo (via github_store.py), and optionally sends ntfy
+notifications. Prints a short success message on every successful fetch.
 
-Behavior is driven by config.json (see config_store.py) which can be edited
-live via the web interface -- this script re-reads it every loop iteration.
+Source health tracking:
+  - A persistent "healthy pool" of sources that have at least once yielded
+    parseable content is stored at /data/healthy_sources.json.
+  - Every 5 minutes, candidates NOT currently in the healthy pool are
+    (re-)probed; a parseable response promotes them into the pool.
+  - A healthy source that fails to yield parseable content for a
+    continuous 5 minutes is evicted from the pool.
+  - Challenge/interstitial pages (Anubis, Cloudflare, etc.) are treated
+    as an ordinary parse failure, not a special instant-eviction signal.
+
+Rotation:
+  - With N healthy sources, one is polled every (60 / N) seconds, at fixed
+    stagger positions within each 60-second cycle (e.g. N=6 -> :00 :10 :20
+    :30 :40 :50). Timing is strict -- a new-post hit does not trigger an
+    early extra poll.
+  - With 0 healthy sources, the loop still runs the 5-minute discovery
+    probe against all candidates; no fetch content occurs until at least
+    one becomes healthy.
+
+Behavior (notifications, ntfy topic) is driven by config.json (see
+config_store.py), re-read every loop iteration so web-UI edits apply
+live.
 
 Run standalone:
     python elc8.py
@@ -15,58 +35,67 @@ or import run_collector() from start.py.
 
 import os
 import re
-import time
 import json
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from config_store import load_config
 from github_store import read_csv_rows, append_csv_rows, CSV_HEADER
 
+EASTERN = ZoneInfo("America/New_York")
+
+DATA_DIR = os.environ.get("MUSKMETER_DATA_DIR", "/data")
+HEALTHY_SOURCES_PATH = os.path.join(DATA_DIR, "healthy_sources.json")
+
 NTFY_BASE = "https://ntfy.sh"
-MUSKMETER_URL = "https://www.muskmeter.live/"
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+TARGET_USER = "elonmusk"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
 
-from zoneinfo import ZoneInfo
+TIMEOUT_SECONDS = 15
 
-def send_ntfy_notification(topic, message, title="New Post Detected!", priority=3):
-    if not topic:
-        return
-    url = f"{NTFY_BASE}/{topic}"
-    req = urllib.request.Request(
-        url,
-        data=message.encode("utf-8"),
-        headers={
-            "Title": title,
-            "Priority": str(priority),
-            "Tags": "chart_with_upwards_trend,robot_face",
-            "Click": "https://www.muskmeter.live/",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            if resp.status == 200:
-                print("  [notify] sent")
-            else:
-                print(f"  [notify] failed: {resp.status}")
-    except urllib.error.URLError as e:
-        print(f"  [notify] error: {e}")
+DISCOVERY_INTERVAL_SECONDS = 5 * 60
+EVICTION_WINDOW_SECONDS = 5 * 60
 
+# Each candidate source: a unique id, a kind ("muskmeter" or "nitter"), and
+# the URL to fetch. Nitter instances all share the same parser; muskmeter
+# has its own dedicated one.
+NITTER_INSTANCES = [
+    "nitter.net",
+    "nitter.catsarch.com",
+    "nitter.tiekoetter.com",
+    "nitter.kareem.one",
+    "xcancel.com",
+    "nitter.privacyredirect.com",
+    "nitter.space",
+    "lightbrd.com",
+    "nuku.trabun.org",
+    "nitter.poast.org",
+]
 
-def fetch(url, headers, timeout=15):
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8", errors="replace"), resp.status, "ok"
-    except urllib.error.HTTPError as e:
-        if e.code == 429:
-            return None, 429, "rate_limited"
-        return None, e.code, "error"
-    except urllib.error.URLError as e:
-        print(f"[{utc_now_str()}] request error: {e}")
-        return None, None, "error"
+CANDIDATES = [{"id": "muskmeter.live", "kind": "muskmeter",
+               "url": "https://www.muskmeter.live/"}]
+for _inst in NITTER_INSTANCES:
+    CANDIDATES.append({
+        "id": _inst, "kind": "nitter",
+        "url": f"https://{_inst}/{TARGET_USER}",
+    })
+
+CHALLENGE_MARKERS = [
+    "making sure you're not a bot",
+    "protected by anubis",
+    "checking your browser",
+    "just a moment",
+    "cf-browser-verification",
+    "cf_chl_",
+    "attention required",
+    "ddos protection by",
+    "captcha-delivery.com",
+    'id="anubis',
+]
 
 
 def utc_now():
@@ -77,14 +106,7 @@ def utc_now_str():
     return utc_now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-
-
-EASTERN = ZoneInfo("America/New_York")
-
-
 def to_est(dt_utc):
-    """Convert an aware UTC datetime to US-Eastern, correctly handling the
-    EST/EDT transition (unlike a fixed offset)."""
     return dt_utc.astimezone(EASTERN)
 
 
@@ -98,14 +120,69 @@ def format_datetime_est_from_utc(dt_utc):
     return at_str, date_str, time_str
 
 
-def extract_post_count(html_content):
+def is_challenge_page(text_lower):
+    return any(marker in text_lower for marker in CHALLENGE_MARKERS)
+
+
+def send_ntfy_notification(topic, message, title="New Post Detected!", priority=3):
+    if not topic:
+        return
+    url = f"{NTFY_BASE}/{topic}"
+    req = urllib.request.Request(
+        url,
+        data=message.encode("utf-8"),
+        headers={
+            "Title": title,
+            "Priority": str(priority),
+            "Tags": "chart_with_upwards_trend,robot_face",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status == 200:
+                print("  [notify] sent")
+            else:
+                print(f"  [notify] failed: {resp.status}")
+    except urllib.error.URLError as e:
+        print(f"  [notify] error: {e}")
+
+
+def fetch(url, timeout=TIMEOUT_SECONDS):
+    headers = {
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+            return resp.status, body, "ok"
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            return 429, None, "rate_limited"
+        try:
+            body = e.read()
+        except Exception:
+            body = b""
+        return e.code, body, "error"
+    except urllib.error.URLError as e:
+        print(f"[{utc_now_str()}] request error for {url}: {e}")
+        return None, None, "error"
+
+
+# ---------------------------------------------------------------------------
+# muskmeter.live parser (existing logic)
+# ---------------------------------------------------------------------------
+
+def extract_post_count_muskmeter(html_content):
     match = re.search(r'Posts 24h \((\d+)\)', html_content)
     return int(match.group(1)) if match else None
 
 
-def extract_tweets_with_timestamps(html_content):
-    """Returns a list of dicts with id, content, type, relative_time,
-    posted_datetime (UTC-aware datetime or None)."""
+def extract_tweets_muskmeter(html_content):
+    """Returns a list of dicts with id, content, type, posted_datetime (UTC)."""
     tweets = []
     now_utc = utc_now()
 
@@ -157,29 +234,323 @@ def extract_tweets_with_timestamps(html_content):
             "id": tweet_id,
             "content": content,
             "type": tweet_type,
-            "relative_time": relative_time,
             "posted_datetime": posted_datetime,
         })
 
     return tweets
 
 
+def parse_muskmeter(html_text):
+    """Returns (tweets_list, parseable_bool). parseable is True if the page
+    structure was recognized at all (post count found), even if 0 tweets
+    were extracted (e.g. genuinely no new posts)."""
+    lower = html_text.lower()
+    if is_challenge_page(lower):
+        return [], False
+    count = extract_post_count_muskmeter(html_text)
+    if count is None:
+        return [], False
+    tweets = extract_tweets_muskmeter(html_text)
+    return tweets, True
+    # ---------------------------------------------------------------------------
+# Nitter parser
+#
+# Structure (see nitter_nitter_kareem_one_elonmusk.html):
+#   <div class="timeline-item ..." data-username="elonmusk">
+#     <a class="tweet-link" href="/elonmusk/status/<id>#m"></a>
+#     <div class="tweet-body">
+#       <div>
+#         [optional] <div class="retweet-header">...retweeted</div>
+#         <div class="tweet-header">...
+#           <span class="tweet-date"><a ... title="Jul 15, 2026 · 1:11 PM UTC">14h</a></span>
+#         </div>
+#       </div>
+#       <div class="tweet-content media-body" dir="auto">TEXT</div>
+#       [optional nested quote block -- must be excluded from TEXT capture]
+#       <div class="tweet-stats">...</div>
+#     </div>
+#   </div>
+#
+# data-username on the outer timeline-item tells us whose item this is --
+# if it isn't "elonmusk", it's a retweet by definition (Nitter shows
+# retweets under the followed account's timeline but data-username is the
+# ORIGINAL author). tweet-content is a direct sibling-level div (not
+# nested inside quote-big), so a non-greedy match up to the next top-level
+# div boundary keeps quoted text out.
+# ---------------------------------------------------------------------------
+
+NITTER_ITEM_RE = re.compile(
+    r'<div class="timeline-item[^"]*"\s+data-username="([^"]*)">(.*?)'
+    r'(?=<div class="timeline-item|<div class="show-more"|\Z)',
+    re.DOTALL,
+)
+NITTER_LINK_RE = re.compile(r'<a class="tweet-link" href="/[^/]+/status/(\d+)')
+NITTER_RETWEET_HEADER_RE = re.compile(r'<div class="retweet-header">')
+NITTER_CONTENT_RE = re.compile(
+    r'<div class="tweet-content media-body"[^>]*>(.*?)</div>\s*(?:<div class="(?:quote|attachments|card|tweet-stats))',
+    re.DOTALL,
+)
+NITTER_DATE_TITLE_RE = re.compile(
+    r'<span class="tweet-date"><a[^>]*title="([^"]*)"',
+)
+
+
+def _strip_tags(html_fragment):
+    text = re.sub(r'<[^>]+>', '', html_fragment)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def _parse_nitter_absolute_timestamp(title_str):
+    """title looks like 'Jul 15, 2026 · 1:11 PM UTC'. Returns aware UTC
+    datetime, or None if it doesn't parse."""
+    cleaned = title_str.replace("\u00b7", "").strip()
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    try:
+        naive = datetime.strptime(cleaned, "%b %d, %Y %I:%M %p UTC")
+        return naive.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def extract_tweets_nitter(html_content, target_user=TARGET_USER):
+    tweets = []
+
+    for item_match in NITTER_ITEM_RE.finditer(html_content):
+        item_username = item_match.group(1)
+        item_html = item_match.group(2)
+
+        link_match = NITTER_LINK_RE.search(item_html)
+        if not link_match:
+            continue
+        tweet_id = link_match.group(1)
+
+        is_retweet = bool(NITTER_RETWEET_HEADER_RE.search(item_html)) or (
+            item_username.lower() != target_user.lower()
+        )
+
+        content = ""
+        content_match = NITTER_CONTENT_RE.search(item_html)
+        if content_match:
+            content = _strip_tags(content_match.group(1))
+
+        date_match = NITTER_DATE_TITLE_RE.search(item_html)
+        posted_datetime = None
+        if date_match:
+            posted_datetime = _parse_nitter_absolute_timestamp(date_match.group(1))
+
+        tweets.append({
+            "id": tweet_id,
+            "content": content,
+            "type": "retweet" if is_retweet else "direct",
+            "posted_datetime": posted_datetime,
+        })
+
+    return tweets
+
+
+def parse_nitter(html_text):
+    """Returns (tweets_list, parseable_bool)."""
+    lower = html_text.lower()
+    if is_challenge_page(lower):
+        return [], False
+    if "timeline-item" not in html_text:
+        return [], False
+    tweets = extract_tweets_nitter(html_text)
+    return tweets, True
+
+
+def parse_source(kind, html_text):
+    if kind == "muskmeter":
+        return parse_muskmeter(html_text)
+    return parse_nitter(html_text)
+
+
+# ---------------------------------------------------------------------------
+# Health-pool persistence
+#
+# State shape on disk:
+# {
+#   "healthy": {"<source_id>": {"since": <iso>, "last_success": <iso>}, ...},
+#   "last_discovery_probe": <iso or null>
+# }
+# ---------------------------------------------------------------------------
+
+def _default_health_state():
+    return {"healthy": {}, "last_discovery_probe": None}
+
+
+def load_health_state():
+    if not os.path.exists(HEALTHY_SOURCES_PATH):
+        return _default_health_state()
+    try:
+        with open(HEALTHY_SOURCES_PATH, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        if not isinstance(state, dict) or "healthy" not in state:
+            return _default_health_state()
+        return state
+    except (json.JSONDecodeError, OSError):
+        return _default_health_state()
+
+
+def save_health_state(state):
+    parent = os.path.dirname(HEALTHY_SOURCES_PATH)
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent, exist_ok=True)
+    tmp_path = HEALTHY_SOURCES_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp_path, HEALTHY_SOURCES_PATH)
+
+
+def mark_success(state, source_id):
+    now_iso = utc_now().isoformat()
+    entry = state["healthy"].get(source_id)
+    if entry is None:
+        entry = {"since": now_iso, "last_success": now_iso}
+        print(f"  [health] promoting '{source_id}' to healthy pool")
+    else:
+        entry["last_success"] = now_iso
+    state["healthy"][source_id] = entry
+
+
+def evict_stale(state):
+    """Drop any healthy source whose last_success is older than the
+    eviction window."""
+    now = utc_now()
+    to_drop = []
+    for source_id, entry in state["healthy"].items():
+        try:
+            last_success = datetime.fromisoformat(entry["last_success"])
+        except (KeyError, ValueError):
+            to_drop.append(source_id)
+            continue
+        if (now - last_success).total_seconds() > EVICTION_WINDOW_SECONDS:
+            to_drop.append(source_id)
+    for source_id in to_drop:
+        print(f"  [health] evicting '{source_id}' (no parseable result for "
+              f"{EVICTION_WINDOW_SECONDS // 60} min)")
+        del state["healthy"][source_id]
+
+
+def should_run_discovery(state):
+    last = state.get("last_discovery_probe")
+    if last is None:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(last)
+    except ValueError:
+        return True
+    return (utc_now() - last_dt).total_seconds() >= DISCOVERY_INTERVAL_SECONDS
+
+
+def candidate_by_id(source_id):
+    for c in CANDIDATES:
+        if c["id"] == source_id:
+            return c
+    return None
+
+
+def run_discovery_probe(state):
+    """Probe every candidate not currently in the healthy pool; promote on
+    a parseable response. Always updates last_discovery_probe regardless
+    of outcome, so this runs on a fixed cadence."""
+    print(f"[{utc_now_str()}] running discovery probe...")
+    for candidate in CANDIDATES:
+        source_id = candidate["id"]
+        if source_id in state["healthy"]:
+            continue
+        status, body, fetch_status = fetch(candidate["url"])
+        if fetch_status != "ok" or body is None:
+            print(f"  [discovery] '{source_id}': unreachable/error, still unhealthy")
+            continue
+        try:
+            html_text = body.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        _tweets, parseable = parse_source(candidate["kind"], html_text)
+        if parseable:
+            mark_success(state, source_id)
+        else:
+            print(f"  [discovery] '{source_id}': reachable but not parseable, still unhealthy")
+    state["last_discovery_probe"] = utc_now().isoformat()
+    save_health_state(state)
+
+
+def compute_stagger_schedule(healthy_ids):
+    """Given a list of healthy source ids, returns list of (offset_seconds,
+    source_id) evenly spread across a 60-second cycle."""
+    n = len(healthy_ids)
+    if n == 0:
+        return []
+    step = 60.0 / n
+    return [(round(i * step, 3), source_id) for i, source_id in enumerate(healthy_ids)]
+
+
+# ---------------------------------------------------------------------------
+# Main collector loop
+# ---------------------------------------------------------------------------
+
 def load_seen_ids():
-    """Pull the current CSV from GitHub once at startup to seed the seen-id
-    set, so a restart doesn't re-notify on every historical post."""
     header, rows, sha = read_csv_rows()
-    id_idx = 0  # 'Tweet ID' is column 0
     seen = set()
     for row in rows:
         if row:
-            seen.add(row[id_idx])
+            seen.add(row[0])
     return seen
 
 
+def process_fetch_result(source_id, kind, html_text, seen_tweet_ids, cfg):
+    """Parses one fetched page, appends any new posts to GitHub, sends
+    notifications as configured. Returns number of new posts found."""
+    tweets, parseable = parse_source(kind, html_text)
+    if not parseable:
+        return None  # signals failure to caller (for health tracking)
+
+    new_posts = [t for t in tweets if t["id"] not in seen_tweet_ids]
+    if not new_posts:
+        return 0
+
+    for t in new_posts:
+        seen_tweet_ids.add(t["id"])
+
+    now_utc = utc_now()
+    imported_at, imported_date, imported_time = format_datetime_est_from_utc(now_utc)
+
+    rows_to_append = []
+    for t in new_posts:
+        posted_at, posted_date, posted_time = format_datetime_est_from_utc(t["posted_datetime"])
+        rows_to_append.append([
+            t["id"], "elonmusk", t["content"],
+            posted_at, posted_date, posted_time,
+            imported_at, imported_date, imported_time,
+        ])
+
+    try:
+        append_csv_rows(rows_to_append, commit_message=f"elc8 ({source_id}): +{len(rows_to_append)} post(s)")
+    except RuntimeError as e:
+        print(f"  [github] write failed: {e}")
+        for t in new_posts:
+            seen_tweet_ids.discard(t["id"])
+        return None
+
+    for t in new_posts:
+        print(f"  NEW {t['id']} ({t['type']}) via {source_id}")
+        if t["content"]:
+            print(f"    {t['content'][:100]}")
+
+    if cfg.get("notify_every_post", True):
+        ntfy_topic = cfg.get("ntfy_topic", "chan6667")
+        for t in new_posts[:2]:
+            msg = f"{t['type']} post (via {source_id})"
+            if t["content"]:
+                msg += f"\n{t['content'][:200]}"
+            send_ntfy_notification(ntfy_topic, msg, "Elon Musk post", priority=3)
+
+    return len(new_posts)
+
+
 def run_collector(stop_event=None):
-    """Main collector loop. If stop_event (threading.Event) is provided,
-    the loop exits cleanly when it is set -- used by start.py to allow
-    graceful shutdown of the whole process group."""
     cfg = load_config()
     ntfy_topic = cfg.get("ntfy_topic", "chan6667")
 
@@ -187,110 +558,71 @@ def run_collector(stop_event=None):
     seen_tweet_ids = load_seen_ids()
     print(f"Loaded {len(seen_tweet_ids)} known tweet IDs.")
 
+    state = load_health_state()
+    print(f"Healthy pool at startup: {sorted(state['healthy'].keys()) or '(empty)'}")
+
     if cfg.get("notify_on_start_stop", True):
         send_ntfy_notification(ntfy_topic, "elc8 collector started", "Collector Started", priority=2)
-
-    headers = {"User-Agent": UA}
-
-    interval = cfg.get("poll_start_interval", 5)
-    min_interval = cfg.get("poll_min_interval", 3)
-    max_interval = cfg.get("poll_max_interval", 60)
-    start_interval = cfg.get("poll_start_interval", 5)
-    consecutive_errors = 0
 
     try:
         while True:
             if stop_event is not None and stop_event.is_set():
                 break
 
-            # Re-read config every iteration so web-UI edits apply live.
             cfg = load_config()
-            ntfy_topic = cfg.get("ntfy_topic", "chan6667")
-            notify_every_post = cfg.get("notify_every_post", True)
-            min_interval = cfg.get("poll_min_interval", min_interval)
-            max_interval = cfg.get("poll_max_interval", max_interval)
-            start_interval = cfg.get("poll_start_interval", start_interval)
 
-            html, status_code, status = fetch(MUSKMETER_URL, headers)
+            if should_run_discovery(state):
+                run_discovery_probe(state)
 
-            if status == "rate_limited":
-                interval = min(max_interval, max(interval * 2, 10))
-                print(f"[{utc_now_str()}] 429 rate limited -> backing off to {interval:.1f}s")
-                time.sleep(interval)
+            evict_stale(state)
+            save_health_state(state)
+
+            healthy_ids = sorted(state["healthy"].keys())
+            schedule = compute_stagger_schedule(healthy_ids)
+
+            if not schedule:
+                print(f"[{utc_now_str()}] no healthy sources yet, waiting for next discovery probe...")
+                _sleep_interruptible(min(30, DISCOVERY_INTERVAL_SECONDS), stop_event)
                 continue
 
-            if status == "error":
-                consecutive_errors += 1
-                interval = min(max_interval, interval * 1.5)
-                print(f"[{utc_now_str()}] fetch error (consecutive={consecutive_errors})")
-                time.sleep(interval)
-                if consecutive_errors > 20:
-                    print("Too many consecutive errors, stopping collector.")
+            cycle_start = time.monotonic()
+            for offset, source_id in schedule:
+                if stop_event is not None and stop_event.is_set():
                     break
-                continue
 
-            consecutive_errors = 0
-            current_count = extract_post_count(html)
-            tweets = extract_tweets_with_timestamps(html)
+                target_time = cycle_start + offset
+                now = time.monotonic()
+                if target_time > now:
+                    _sleep_interruptible(target_time - now, stop_event)
 
-            if current_count is None:
-                print(f"[{utc_now_str()}] fetched OK but could not extract post count")
-                time.sleep(interval)
-                continue
-
-            print(f"[{utc_now_str()}] OK read muskmeter.live (posts_24h={current_count}, "
-                  f"tweets_seen_on_page={len(tweets)})")
-
-            new_posts = []
-            now_utc = utc_now()
-            imported_at, imported_date, imported_time = format_datetime_est_from_utc(now_utc)
-
-            for tweet in tweets:
-                if tweet["id"] in seen_tweet_ids:
+                candidate = candidate_by_id(source_id)
+                if candidate is None:
                     continue
-                seen_tweet_ids.add(tweet["id"])
-                new_posts.append(tweet)
 
-            if new_posts:
-                rows_to_append = []
-                for tweet in new_posts:
-                    posted_at, posted_date, posted_time = format_datetime_est_from_utc(tweet["posted_datetime"])
-                    rows_to_append.append([
-                        tweet["id"], "elonmusk", tweet["content"],
-                        posted_at, posted_date, posted_time,
-                        imported_at, imported_date, imported_time,
-                    ])
+                status, body, fetch_status = fetch(candidate["url"])
+
+                if fetch_status == "rate_limited":
+                    print(f"[{utc_now_str()}] {source_id}: 429 rate limited")
+                    continue
+                if fetch_status != "ok" or body is None:
+                    print(f"[{utc_now_str()}] {source_id}: fetch error")
+                    continue
 
                 try:
-                    append_csv_rows(rows_to_append, commit_message=f"elc8: +{len(rows_to_append)} post(s)")
-                    print(f"  wrote {len(rows_to_append)} new row(s) to GitHub CSV")
-                except RuntimeError as e:
-                    print(f"  [github] write failed: {e}")
-                    # Roll back seen-id additions so we retry next loop
-                    for tweet in new_posts:
-                        seen_tweet_ids.discard(tweet["id"])
-                    time.sleep(interval)
+                    html_text = body.decode("utf-8", errors="replace")
+                except Exception:
                     continue
 
-                for tweet in new_posts:
-                    print(f"  NEW {tweet['id']} ({tweet['type']}) posted {tweet['relative_time']} ago")
-                    if tweet["content"]:
-                        print(f"    {tweet['content'][:100]}")
+                result = process_fetch_result(source_id, candidate["kind"], html_text, seen_tweet_ids, cfg)
 
-                if notify_every_post:
-                    for tweet in new_posts[:2]:
-                        msg = f"{tweet['type']} post"
-                        if tweet["content"]:
-                            msg += f"\n{tweet['content'][:200]}"
-                        send_ntfy_notification(
-                            ntfy_topic, msg, f"Elon Musk post #{current_count}", priority=3
-                        )
+                if result is None:
+                    print(f"[{utc_now_str()}] {source_id}: OK read, but not parseable "
+                          f"(challenge page or structure mismatch)")
+                else:
+                    mark_success(state, source_id)
+                    print(f"[{utc_now_str()}] OK read {source_id} (+{result} new post(s))")
 
-                interval = max(min_interval, interval * 0.5)
-            else:
-                interval = min(start_interval, interval * 1.1) if interval < start_interval else interval
-
-            time.sleep(interval)
+            save_health_state(state)
 
     except KeyboardInterrupt:
         pass
@@ -303,6 +635,19 @@ def run_collector(stop_event=None):
                 f"elc8 collector stopped. Total posts: {len(seen_tweet_ids)}",
                 "Collector Stopped", priority=2,
             )
+
+
+def _sleep_interruptible(seconds, stop_event):
+    if seconds <= 0:
+        return
+    if stop_event is None:
+        time.sleep(seconds)
+        return
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if stop_event.is_set():
+            return
+        time.sleep(min(0.5, end - time.monotonic()))
 
 
 if __name__ == "__main__":
