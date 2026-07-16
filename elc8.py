@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
 """
-Collector: polls 2 Nitter sources on a fixed stagger within each 60s cycle:
-:00 nitter.kareem.one, :30 xcancel.com. Appends new posts to the CSV stored
-in the GitHub repo (via github_store.py) and optionally sends ntfy
-notifications.
+Collector: 3 fixed-schedule sources per 60s cycle.
+  :00  nitter.kareem.one  -> direct posts (Nitter has no retweet-event ID,
+                              so retweet extraction from Nitter is disabled)
+  :15  xcancel.com        -> direct posts (second Nitter mirror, same role)
+  :30  muskmeter.live     -> retweets ONLY (direct-post extraction from
+                              muskmeter is disabled -- it previously caused
+                              duplicate/low-precision writes racing against
+                              Nitter). Muskmeter's URLs are namespaced under
+                              /elonmusk/status/<id> regardless of retweet
+                              status, giving a retweet-specific ID Nitter
+                              cannot provide.
 
-muskmeter.live has been dropped entirely: its relative-time reconstruction
-produces lower-precision timestamps (rounded to the minute, :00 seconds)
-than Nitter's own precise absolute timestamps, and mixing the two sources
-risked a given post's canonical CSV timestamp coming from whichever source
-won the race for that polling cycle -- not necessarily the more precise one.
-Nitter-only removes this failure mode entirely rather than mitigating it.
+Muskmeter's relative timestamps ("Xm", "Xh") are whole-unit granularity, so
+multiple retweets can collide into the same reported minute. When that
+happens, they are assumed evenly spaced within that minute:
+    offset(i, N) = i * 60 / (N + 1),  i = 1..N
+with i=1 = oldest of the batch (earliest offset within the minute) and
+i=N = most recent (latest offset), since page order (top = most recent)
+determines relative recency within the batch.
+
+Appends new posts to the CSV stored in the GitHub repo (via
+github_store.py) and optionally sends ntfy notifications.
 
 Log format (one line per event):
     ACTION: outcome (detail)
@@ -20,7 +31,7 @@ import re
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from config_store import load_config
@@ -34,13 +45,13 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
 TIMEOUT_SECONDS = 15
 
-# Launch time in EST (when the collector was first deployed)
-LAUNCH_TIME_EST = datetime(2024, 1, 1, 0, 0, 0, tzinfo=EASTERN)  # Adjust this to actual launch date
-
-# Fixed 2-source rotation, staggered at :00 :30 within each 60s cycle.
 SOURCES = [
-    {"id": "nitter.kareem.one", "url": f"https://nitter.kareem.one/{TARGET_USER}", "offset": 0},
-    {"id": "xcancel.com", "url": f"https://xcancel.com/{TARGET_USER}", "offset": 30},
+    {"id": "nitter.kareem.one", "kind": "nitter_direct",
+     "url": f"https://nitter.kareem.one/{TARGET_USER}", "offset": 0},
+    {"id": "xcancel.com", "kind": "nitter_direct",
+     "url": f"https://xcancel.com/{TARGET_USER}", "offset": 15},
+    {"id": "muskmeter.live", "kind": "muskmeter_retweets",
+     "url": "https://www.muskmeter.live/", "offset": 30},
 ]
 
 CHALLENGE_MARKERS = [
@@ -63,11 +74,6 @@ def utc_now():
     return datetime.now(timezone.utc)
 
 
-def est_now():
-    """Return current time in EST."""
-    return datetime.now(EASTERN)
-
-
 def log(action, outcome, detail=""):
     ts = utc_now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {action}: {outcome}"
@@ -80,13 +86,13 @@ def to_est(dt_utc):
     return dt_utc.astimezone(EASTERN)
 
 
-def format_datetime_est(dt_est):
-    """Format an EST datetime into display strings."""
-    if dt_est is None:
+def format_datetime_est_from_utc(dt_utc):
+    if dt_utc is None:
         return "", "", ""
-    at_str = dt_est.strftime("%-m/%-d/%Y, %-I:%M:%S %p")
-    date_str = dt_est.strftime("%-m/%-d/%Y")
-    time_str = dt_est.strftime("%-I:%M:%S %p")
+    est_dt = to_est(dt_utc)
+    at_str = est_dt.strftime("%-m/%-d/%Y, %-I:%M:%S %p")
+    date_str = est_dt.strftime("%-m/%-d/%Y")
+    time_str = est_dt.strftime("%-I:%M:%S %p")
     return at_str, date_str, time_str
 
 
@@ -137,7 +143,7 @@ def fetch(url, timeout=TIMEOUT_SECONDS):
 
 
 # ---------------------------------------------------------------------------
-# Nitter parser
+# Nitter parser (direct posts only)
 # ---------------------------------------------------------------------------
 
 NITTER_ITEM_RE = re.compile(
@@ -164,7 +170,6 @@ def _strip_tags(html_fragment):
 
 
 def _parse_nitter_absolute_timestamp(title_str):
-    """Parse Nitter's UTC timestamp string to UTC datetime."""
     cleaned = re.sub(r'\s+', ' ', title_str.replace("\u00b7", "").strip())
     try:
         return datetime.strptime(cleaned, "%b %d, %Y %I:%M %p UTC").replace(tzinfo=timezone.utc)
@@ -172,20 +177,26 @@ def _parse_nitter_absolute_timestamp(title_str):
         return None
 
 
-def extract_tweets_nitter(html_content, target_user=TARGET_USER):
-    tweets = []
+def extract_direct_posts_nitter(html_content, target_user=TARGET_USER):
+    """Returns only DIRECT posts (data-username == target_user AND no
+    retweet-header). Retweets are skipped entirely here -- muskmeter owns
+    retweet extraction, since Nitter cannot provide a retweet-specific ID
+    or timestamp (its anchor/date always reflect the ORIGINAL tweet)."""
+    posts = []
     for item_match in NITTER_ITEM_RE.finditer(html_content):
         item_username = item_match.group(1)
         item_html = item_match.group(2)
+
+        is_retweet = bool(NITTER_RETWEET_HEADER_RE.search(item_html)) or (
+            item_username.lower() != target_user.lower()
+        )
+        if is_retweet:
+            continue
 
         link_match = NITTER_LINK_RE.search(item_html)
         if not link_match:
             continue
         tweet_id = link_match.group(1)
-
-        is_retweet = bool(NITTER_RETWEET_HEADER_RE.search(item_html)) or (
-            item_username.lower() != target_user.lower()
-        )
 
         content = ""
         content_match = NITTER_CONTENT_RE.search(item_html)
@@ -193,25 +204,130 @@ def extract_tweets_nitter(html_content, target_user=TARGET_USER):
             content = _strip_tags(content_match.group(1))
 
         date_match = NITTER_DATE_TITLE_RE.search(item_html)
-        posted_datetime_utc = _parse_nitter_absolute_timestamp(date_match.group(1)) if date_match else None
+        posted_datetime = _parse_nitter_absolute_timestamp(date_match.group(1)) if date_match else None
+        if posted_datetime is None:
+            continue  # cannot trust an unparseable timestamp for a direct post
 
-        tweets.append({
-            "id": tweet_id, 
+        posts.append({
+            "id": tweet_id,
             "content": content,
-            "type": "retweet" if is_retweet else "direct",
-            "posted_datetime_utc": posted_datetime_utc,  # Original post time (UTC)
-            "is_retweet": is_retweet,
+            "type": "direct",
+            "posted_datetime": posted_datetime,
+            "timestamp_confidence": "exact",
         })
-    return tweets
+    return posts
 
 
-def parse_nitter(html_text):
+def parse_nitter_direct(html_text):
     lower = html_text.lower()
     if is_challenge_page(lower):
         return [], False
     if "timeline-item" not in html_text:
         return [], False
-    return extract_tweets_nitter(html_text), True
+    return extract_direct_posts_nitter(html_text), True
+
+
+# ---------------------------------------------------------------------------
+# Muskmeter parser (retweets only)
+# ---------------------------------------------------------------------------
+
+MUSKMETER_TWEET_RE = re.compile(
+    r'<a href="https://x\.com/elonmusk/status/(\d+)"[^>]*>(.*?)</a>',
+    re.DOTALL,
+)
+MUSKMETER_RT_CONTENT_RE = re.compile(r'<p class="rt-text[^"]*">(.*?)</p>', re.DOTALL)
+MUSKMETER_DATE_RE = re.compile(r'<span class="date[^"]*">(.*?)</span>', re.DOTALL)
+MUSKMETER_POST_COUNT_RE = re.compile(r'Posts 24h \((\d+)\)')
+
+
+def parse_muskmeter_relative_time(relative_time, now_utc):
+    """Returns (bucket_start_utc, bucket_end_utc) for the whole-minute
+    bucket this relative time falls into, or None if unparseable."""
+    if not relative_time:
+        return None
+    try:
+        if relative_time in ("now", "Just now"):
+            approx = now_utc
+        elif "d" in relative_time:
+            approx = now_utc - timedelta(days=int(re.search(r'(\d+)d', relative_time).group(1)))
+        elif "h" in relative_time:
+            approx = now_utc - timedelta(hours=int(re.search(r'(\d+)h', relative_time).group(1)))
+        elif "m" in relative_time:
+            approx = now_utc - timedelta(minutes=int(re.search(r'(\d+)m', relative_time).group(1)))
+        else:
+            return None
+    except (AttributeError, ValueError):
+        return None
+
+    bucket_start = approx.replace(second=0, microsecond=0)
+    return bucket_start, bucket_start + timedelta(minutes=1)
+
+
+def extract_retweets_muskmeter(html_content, now_utc):
+    """Returns retweet-only dicts: id, content, bucket_start, page_order
+    (0 = most recent, i.e. topmost on page). Direct posts (no rt-text
+    block) are skipped -- Nitter owns those."""
+    retweets = []
+    for page_order, match in enumerate(MUSKMETER_TWEET_RE.finditer(html_content)):
+        tweet_id = match.group(1)
+        tweet_html = match.group(2)
+
+        rt_match = MUSKMETER_RT_CONTENT_RE.search(tweet_html)
+        if not rt_match:
+            continue
+
+        content = re.sub(r'<[^>]+>', '', rt_match.group(1)).strip()
+        content = re.sub(r'\s+', ' ', content).strip()
+
+        date_match = MUSKMETER_DATE_RE.search(tweet_html)
+        relative_time = date_match.group(1).strip() if date_match else ""
+        bucket = parse_muskmeter_relative_time(relative_time, now_utc)
+        if bucket is None:
+            continue
+
+        retweets.append({
+            "id": tweet_id,
+            "content": content,
+            "bucket_start": bucket[0],
+            "page_order": page_order,
+        })
+    return retweets
+
+
+def assign_even_spacing(retweets_in_same_bucket):
+    """offset(i, N) = i * 60 / (N + 1), i = 1..N; i=1 = oldest of the batch
+    (earliest offset), i=N = most recent (latest offset). page_order=0 is
+    most recent (top of page) so we assign in reverse of page_order."""
+    n = len(retweets_in_same_bucket)
+    ordered = sorted(retweets_in_same_bucket, key=lambda r: -r["page_order"])
+    for i, rt in enumerate(ordered, start=1):
+        offset_seconds = (i * 60.0) / (n + 1)
+        rt["posted_datetime"] = rt["bucket_start"] + timedelta(seconds=offset_seconds)
+        rt["type"] = "retweet"
+        rt["timestamp_confidence"] = "approx_minute_bucket"
+    return ordered
+
+
+def process_muskmeter_retweets(html_text, now_utc):
+    retweets = extract_retweets_muskmeter(html_text, now_utc)
+    buckets = {}
+    for rt in retweets:
+        key = rt["bucket_start"].isoformat()
+        buckets.setdefault(key, []).append(rt)
+
+    result = []
+    for group in buckets.values():
+        result.extend(assign_even_spacing(group))
+    return result
+
+
+def parse_muskmeter_retweets(html_text, now_utc):
+    lower = html_text.lower()
+    if is_challenge_page(lower):
+        return [], False
+    if MUSKMETER_POST_COUNT_RE.search(html_text) is None:
+        return [], False
+    return process_muskmeter_retweets(html_text, now_utc), True
 
 
 # ---------------------------------------------------------------------------
@@ -224,39 +340,23 @@ def load_seen_ids():
     return {row[0] for row in rows if row}
 
 
-def is_valid_post(posted_datetime_est, parsing_time_est):
-    """Check if post should be included:
-    - Must be after launch time
-    - Must not be older than 10 minutes from parsing time
-    - For retweets: we use parsing time, so they're always within 10 min window
-    - For direct posts: check original timestamp is within 10 min
-    """
-    if posted_datetime_est < LAUNCH_TIME_EST:
-        return False
-    
-    # Check if post is older than 10 minutes
-    age = parsing_time_est - posted_datetime_est
-    if age > timedelta(minutes=10):
-        return False
-    
-    return True
+def process_fetch_result(source_id, kind, html_text, seen_tweet_ids, cfg):
+    now_utc = utc_now()
 
+    if kind == "nitter_direct":
+        items, parseable = parse_nitter_direct(html_text)
+    elif kind == "muskmeter_retweets":
+        items, parseable = parse_muskmeter_retweets(html_text, now_utc)
+    else:
+        return None
 
-def process_fetch_result(source_id, html_text, seen_tweet_ids, cfg):
-    tweets, parseable = parse_nitter(html_text)
     if not parseable:
         return None
 
-    # Record the parsing time in EST (this is the time we discovered the post)
-    parsing_time_est = est_now()
-
-    # Filter out already seen tweets
-    new_posts = [t for t in tweets if t["id"] not in seen_tweet_ids]
-    if not new_posts:
+    new_items = [t for t in items if t["id"] not in seen_tweet_ids]
+    if not new_items:
         return 0
 
-    # Re-verify against GitHub directly before writing, in case seen_tweet_ids
-    # drifted from the authoritative CSV (e.g. after a prior write failure).
     try:
         _header, existing_rows, _sha = read_csv_rows()
         existing_ids = {row[0] for row in existing_rows if row}
@@ -264,73 +364,42 @@ def process_fetch_result(source_id, html_text, seen_tweet_ids, cfg):
     except RuntimeError:
         pass
 
-    new_posts = [t for t in new_posts if t["id"] not in seen_tweet_ids]
-    if not new_posts:
+    new_items = [t for t in new_items if t["id"] not in seen_tweet_ids]
+    if not new_items:
         return 0
 
+    for t in new_items:
+        seen_tweet_ids.add(t["id"])
+
+    imported_at, imported_date, imported_time = format_datetime_est_from_utc(now_utc)
+
     rows_to_append = []
-    valid_new_posts = []
-    
-    for t in new_posts:
-        # Determine the effective posted datetime in EST
-        if t["is_retweet"]:
-            # For retweets: use the parsing time as the posted time
-            # because the original timestamp is when the original post was made,
-            # not when Elon retweeted it
-            effective_posted_est = parsing_time_est
-            log("post.process", "retweet_adjusted", 
-                f"id={t['id']} using_parse_time={effective_posted_est.strftime('%m/%d/%Y %I:%M:%S %p')}")
-        else:
-            # For direct posts: convert original UTC timestamp to EST
-            if t["posted_datetime_utc"]:
-                effective_posted_est = to_est(t["posted_datetime_utc"])
-            else:
-                log("post.process", "skip_no_timestamp", f"id={t['id']}")
-                continue
-        
-        # Check if post passes validation
-        if not is_valid_post(effective_posted_est, parsing_time_est):
-            log("post.process", "skip_out_of_window", 
-                f"id={t['id']} type={t['type']} posted={effective_posted_est.strftime('%m/%d/%Y %I:%M:%S %p')}")
-            continue
-        
-        valid_new_posts.append(t)
-        
-        # Format the EST datetime for CSV
-        posted_at, posted_date, posted_time = format_datetime_est(effective_posted_est)
-        imported_at, imported_date, imported_time = format_datetime_est(parsing_time_est)
-        
+    for t in new_items:
+        posted_at, posted_date, posted_time = format_datetime_est_from_utc(t["posted_datetime"])
         rows_to_append.append([
             t["id"], "elonmusk", t["content"],
             posted_at, posted_date, posted_time,
             imported_at, imported_date, imported_time,
         ])
 
-    if not valid_new_posts:
-        return 0
-
-    # Mark these posts as seen
-    for t in valid_new_posts:
-        seen_tweet_ids.add(t["id"])
-
     try:
         append_csv_rows(rows_to_append, commit_message=f"elc8 ({source_id}): +{len(rows_to_append)} post(s)")
         log("github.append_csv", "ok", f"source={source_id} rows={len(rows_to_append)}")
     except RuntimeError as e:
         log("github.append_csv", "error", str(e))
-        for t in valid_new_posts:
+        for t in new_items:
             seen_tweet_ids.discard(t["id"])
         return None
 
     if cfg.get("notify_every_post", True):
         ntfy_topic = cfg.get("ntfy_topic", "chan6667")
-        for t in valid_new_posts[:2]:
+        for t in new_items[:2]:
             msg = f"{t['type']} post (via {source_id})"
             if t["content"]:
                 msg += f"\n{t['content'][:200]}"
             send_ntfy_notification(ntfy_topic, msg, "Elon Musk post", priority=3)
 
-    return len(valid_new_posts)
+    return len(new_items)
 
 
 def _sleep_interruptible(seconds, stop_event):
@@ -352,7 +421,6 @@ def run_collector(stop_event=None):
 
     seen_tweet_ids = load_seen_ids()
     log("collector.start", "ok", f"known_ids={len(seen_tweet_ids)}")
-    log("collector.config", "launch_time", f"{LAUNCH_TIME_EST.strftime('%m/%d/%Y %I:%M:%S %p')} EST")
 
     if cfg.get("notify_on_start_stop", True):
         send_ntfy_notification(ntfy_topic, "elc8 collector started", "Collector Started", priority=2)
@@ -389,7 +457,7 @@ def run_collector(stop_event=None):
                     log("source.fetch", "decode_error", f"{source['id']} {e}")
                     continue
 
-                result = process_fetch_result(source["id"], html_text, seen_tweet_ids, cfg)
+                result = process_fetch_result(source["id"], source["kind"], html_text, seen_tweet_ids, cfg)
 
                 if result is None:
                     log("source.fetch", "unparseable", f"{source['id']} (challenge page or structure mismatch)")
