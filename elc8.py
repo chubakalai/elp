@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
-Collector: polls 3 fixed sources (muskmeter.live + 2 Nitter instances) on a
-fixed stagger within each 60s cycle: :00 muskmeter, :20 nitter A, :40 nitter B.
-Appends new posts to the CSV stored in the GitHub repo (via github_store.py)
-and optionally sends ntfy notifications.
+Collector: polls 2 Nitter sources on a fixed stagger within each 60s cycle:
+:00 nitter.kareem.one, :30 xcancel.com. Appends new posts to the CSV stored
+in the GitHub repo (via github_store.py) and optionally sends ntfy
+notifications.
+
+muskmeter.live has been dropped entirely: its relative-time reconstruction
+produces lower-precision timestamps (rounded to the minute, :00 seconds)
+than Nitter's own precise absolute timestamps, and mixing the two sources
+risked a given post's canonical CSV timestamp coming from whichever source
+won the race for that polling cycle -- not necessarily the more precise one.
+Nitter-only removes this failure mode entirely rather than mitigating it.
 
 Log format (one line per event):
     ACTION: outcome (detail)
-
-Behavior (notifications, ntfy topic) is driven by config.json, re-read
-every loop iteration so web-UI edits apply live.
 """
 
 import re
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from config_store import load_config
@@ -30,12 +34,10 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
 TIMEOUT_SECONDS = 15
 
-# Fixed 3-source rotation: muskmeter + 2 known-working Nitter instances,
-# staggered at :00 :20 :40 within each 60s cycle.
+# Fixed 2-source rotation, staggered at :00 :30 within each 60s cycle.
 SOURCES = [
-    {"id": "muskmeter.live", "kind": "muskmeter", "url": "https://www.muskmeter.live/", "offset": 0},
-    {"id": "nitter.kareem.one", "kind": "nitter", "url": f"https://nitter.kareem.one/{TARGET_USER}", "offset": 20},
-    {"id": "xcancel.com", "kind": "nitter", "url": f"https://xcancel.com/{TARGET_USER}", "offset": 40},
+    {"id": "nitter.kareem.one", "url": f"https://nitter.kareem.one/{TARGET_USER}", "offset": 0},
+    {"id": "xcancel.com", "url": f"https://xcancel.com/{TARGET_USER}", "offset": 30},
 ]
 
 CHALLENGE_MARKERS = [
@@ -50,6 +52,8 @@ CHALLENGE_MARKERS = [
     "captcha-delivery.com",
     'id="anubis',
 ]
+
+_BOILERPLATE_STRINGS = ["Enable hls playback"]
 
 
 def utc_now():
@@ -120,71 +124,8 @@ def fetch(url, timeout=TIMEOUT_SECONDS):
         except Exception:
             body = b""
         return e.code, body, "error"
-    except urllib.error.URLError as e:
+    except urllib.error.URLError:
         return None, None, "error"
-
-
-# ---------------------------------------------------------------------------
-# muskmeter.live parser
-# ---------------------------------------------------------------------------
-
-def extract_post_count_muskmeter(html_content):
-    match = re.search(r'Posts 24h \((\d+)\)', html_content)
-    return int(match.group(1)) if match else None
-
-
-def extract_tweets_muskmeter(html_content):
-    tweets = []
-    now_utc = utc_now()
-
-    for match in re.finditer(
-        r'<a href="https://x\.com/elonmusk/status/(\d+)"[^>]*>(.*?)</a>',
-        html_content, re.DOTALL,
-    ):
-        tweet_id = match.group(1)
-        tweet_html = match.group(2)
-
-        content = ""
-        content_match = re.search(r'<p class="tweet-content[^"]*">(.*?)</p>', tweet_html, re.DOTALL)
-        if content_match:
-            content = re.sub(r'<[^>]+>', '', content_match.group(1)).strip()
-            content = re.sub(r'\s+', ' ', content).strip()
-        if not content:
-            rt_match = re.search(r'<p class="rt-text[^"]*">(.*?)</p>', tweet_html, re.DOTALL)
-            if rt_match:
-                content = re.sub(r'<[^>]+>', '', rt_match.group(1)).strip()
-                content = re.sub(r'\s+', ' ', content).strip()
-
-        date_match = re.search(r'<span class="date[^"]*">(.*?)</span>', tweet_html, re.DOTALL)
-        relative_time = date_match.group(1).strip() if date_match else ""
-
-        posted_datetime = None
-        if relative_time:
-            try:
-                if relative_time in ("now", "Just now"):
-                    posted_datetime = now_utc
-                elif "d" in relative_time:
-                    posted_datetime = now_utc - timedelta(days=int(re.search(r'(\d+)d', relative_time).group(1)))
-                elif "h" in relative_time:
-                    posted_datetime = now_utc - timedelta(hours=int(re.search(r'(\d+)h', relative_time).group(1)))
-                elif "m" in relative_time:
-                    posted_datetime = now_utc - timedelta(minutes=int(re.search(r'(\d+)m', relative_time).group(1)))
-            except (AttributeError, ValueError):
-                posted_datetime = None
-
-        tweet_type = "retweet" if ("RT @" in content or "RT @" in tweet_html[:500]) else "direct"
-        tweets.append({"id": tweet_id, "content": content, "type": tweet_type, "posted_datetime": posted_datetime})
-
-    return tweets
-
-
-def parse_muskmeter(html_text):
-    lower = html_text.lower()
-    if is_challenge_page(lower):
-        return [], False
-    if extract_post_count_muskmeter(html_text) is None:
-        return [], False
-    return extract_tweets_muskmeter(html_text), True
 
 
 # ---------------------------------------------------------------------------
@@ -200,14 +141,18 @@ NITTER_LINK_RE = re.compile(r'<a class="tweet-link" href="/[^/]+/status/(\d+)')
 NITTER_RETWEET_HEADER_RE = re.compile(r'<div class="retweet-header">')
 NITTER_CONTENT_RE = re.compile(
     r'<div class="tweet-content media-body"[^>]*>(.*?)</div>\s*'
-    r'(?:<div class="(?:quote|attachments|card|tweet-stats)|\Z)',
+    r'(?=<div class="(?:quote|attachments|card|tweet-stats)|\Z)',
     re.DOTALL,
 )
 NITTER_DATE_TITLE_RE = re.compile(r'<span class="tweet-date"><a[^>]*title="([^"]*)"')
 
 
 def _strip_tags(html_fragment):
-    return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', html_fragment)).strip()
+    text = re.sub(r'<[^>]+>', '', html_fragment)
+    text = re.sub(r'\s+', ' ', text).strip()
+    for boilerplate in _BOILERPLATE_STRINGS:
+        text = text.replace(boilerplate, "").strip()
+    return text
 
 
 def _parse_nitter_absolute_timestamp(title_str):
@@ -258,10 +203,6 @@ def parse_nitter(html_text):
     return extract_tweets_nitter(html_text), True
 
 
-def parse_source(kind, html_text):
-    return parse_muskmeter(html_text) if kind == "muskmeter" else parse_nitter(html_text)
-
-
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -272,12 +213,25 @@ def load_seen_ids():
     return {row[0] for row in rows if row}
 
 
-def process_fetch_result(source_id, kind, html_text, seen_tweet_ids, cfg):
-    tweets, parseable = parse_source(kind, html_text)
+def process_fetch_result(source_id, html_text, seen_tweet_ids, cfg):
+    tweets, parseable = parse_nitter(html_text)
     if not parseable:
         return None
 
     new_posts = [t for t in tweets if t["id"] not in seen_tweet_ids]
+    if not new_posts:
+        return 0
+
+    # Re-verify against GitHub directly before writing, in case seen_tweet_ids
+    # drifted from the authoritative CSV (e.g. after a prior write failure).
+    try:
+        _header, existing_rows, _sha = read_csv_rows()
+        existing_ids = {row[0] for row in existing_rows if row}
+        seen_tweet_ids.update(existing_ids)
+    except RuntimeError:
+        pass
+
+    new_posts = [t for t in new_posts if t["id"] not in seen_tweet_ids]
     if not new_posts:
         return 0
 
@@ -371,7 +325,7 @@ def run_collector(stop_event=None):
                     log("source.fetch", "decode_error", f"{source['id']} {e}")
                     continue
 
-                result = process_fetch_result(source["id"], source["kind"], html_text, seen_tweet_ids, cfg)
+                result = process_fetch_result(source["id"], html_text, seen_tweet_ids, cfg)
 
                 if result is None:
                     log("source.fetch", "unparseable", f"{source['id']} (challenge page or structure mismatch)")
