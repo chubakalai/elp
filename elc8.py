@@ -25,6 +25,23 @@ github_store.py) and optionally sends ntfy notifications.
 
 Log format (one line per event):
     ACTION: outcome (detail)
+
+Fixes applied vs. prior revision:
+  1. Each source's fetch+process step is now wrapped in a broad
+     try/except inside the per-cycle loop, so an unexpected exception
+     (e.g. a bare socket.timeout / TimeoutError that urllib does not
+     wrap in URLError) logs an error for that source and continues to
+     the next source, instead of silently killing the whole collector
+     thread. A "source.fetch: start" line is also emitted before each
+     fetch begins, so a source that produces no further log line is
+     immediately diagnosable as "hung mid-fetch" rather than invisible.
+  2. Nitter direct-post extraction now also checks the post's own text
+     for a leading "RT @" marker. Some mirrors omit the retweet-header
+     DOM marker for self-retweets/reposts of the account's own prior
+     tweet, which previously caused those items to be misclassified as
+     direct posts and mis-attributed to whichever nitter mirror fetched
+     them. Content is now the deciding signal in addition to the DOM
+     marker and username check.
 """
 
 import re
@@ -69,6 +86,13 @@ CHALLENGE_MARKERS = [
 
 _BOILERPLATE_STRINGS = ["Enable hls playback"]
 
+# Content-level retweet signal, used as a fallback/override for whatever
+# the DOM-marker heuristic (retweet-header div / username mismatch)
+# concludes. Nitter mirrors do not consistently emit a retweet-header
+# div for self-retweets (the account retweeting its own earlier post),
+# so relying on the DOM marker alone under-detects those cases.
+RT_PREFIX_RE = re.compile(r'^\s*RT\s+@\w+:', re.IGNORECASE)
+
 
 def utc_now():
     return datetime.now(timezone.utc)
@@ -79,7 +103,7 @@ def log(action, outcome, detail=""):
     line = f"[{ts}] {action}: {outcome}"
     if detail:
         line += f" ({detail})"
-    print(line)
+    print(line, flush=True)
 
 
 def to_est(dt_utc):
@@ -118,6 +142,8 @@ def send_ntfy_notification(topic, message, title="New Post Detected!", priority=
                 log("ntfy", "failed", f"status={resp.status}")
     except urllib.error.URLError as e:
         log("ntfy", "error", str(e))
+    except Exception as e:
+        log("ntfy", "error", f"unexpected: {e!r}")
 
 
 def fetch(url, timeout=TIMEOUT_SECONDS):
@@ -139,6 +165,12 @@ def fetch(url, timeout=TIMEOUT_SECONDS):
             body = b""
         return e.code, body, "error"
     except urllib.error.URLError:
+        return None, None, "error"
+    except TimeoutError:
+        # socket.timeout / TimeoutError can surface here without being
+        # wrapped in URLError depending on where in the connection the
+        # timeout fires (e.g. mid-read after the connection was already
+        # established). Treat it the same as a URLError-based timeout.
         return None, None, "error"
 
 
@@ -179,17 +211,36 @@ def _parse_nitter_absolute_timestamp(title_str):
 
 def extract_direct_posts_nitter(html_content, target_user=TARGET_USER):
     """Returns only DIRECT posts (data-username == target_user AND no
-    retweet-header). Retweets are skipped entirely here -- muskmeter owns
-    retweet extraction, since Nitter cannot provide a retweet-specific ID
-    or timestamp (its anchor/date always reflect the ORIGINAL tweet)."""
+    retweet-header AND content does not start with 'RT @user:'). Retweets
+    are skipped entirely here -- muskmeter owns retweet extraction, since
+    Nitter cannot provide a retweet-specific ID or timestamp (its
+    anchor/date always reflect the ORIGINAL tweet).
+
+    The retweet-header DOM marker is checked first as before, but some
+    Nitter mirrors omit that marker specifically for self-retweets (the
+    account retweeting its own earlier tweet), because from that mirror's
+    perspective the "author" of the retweeted item and the timeline owner
+    are the same account. Content is therefore also checked: any item
+    whose visible text begins with "RT @<user>:" is treated as a retweet
+    regardless of what the DOM marker says, since that prefix is Nitter's
+    own textual retweet convention and is unambiguous.
+    """
     posts = []
     for item_match in NITTER_ITEM_RE.finditer(html_content):
         item_username = item_match.group(1)
         item_html = item_match.group(2)
 
-        is_retweet = bool(NITTER_RETWEET_HEADER_RE.search(item_html)) or (
-            item_username.lower() != target_user.lower()
-        )
+        has_retweet_header = bool(NITTER_RETWEET_HEADER_RE.search(item_html))
+        wrong_username = item_username.lower() != target_user.lower()
+
+        content = ""
+        content_match = NITTER_CONTENT_RE.search(item_html)
+        if content_match:
+            content = _strip_tags(content_match.group(1))
+
+        looks_like_retweet_text = bool(RT_PREFIX_RE.match(content))
+
+        is_retweet = has_retweet_header or wrong_username or looks_like_retweet_text
         if is_retweet:
             continue
 
@@ -197,11 +248,6 @@ def extract_direct_posts_nitter(html_content, target_user=TARGET_USER):
         if not link_match:
             continue
         tweet_id = link_match.group(1)
-
-        content = ""
-        content_match = NITTER_CONTENT_RE.search(item_html)
-        if content_match:
-            content = _strip_tags(content_match.group(1))
 
         date_match = NITTER_DATE_TITLE_RE.search(item_html)
         posted_datetime = _parse_nitter_absolute_timestamp(date_match.group(1)) if date_match else None
@@ -442,27 +488,45 @@ def run_collector(stop_event=None):
                 if target_time > now:
                     _sleep_interruptible(target_time - now, stop_event)
 
-                status, body, fetch_status = fetch(source["url"])
-
-                if fetch_status == "rate_limited":
-                    log("source.fetch", "rate_limited", source["id"])
-                    continue
-                if fetch_status != "ok" or body is None:
-                    log("source.fetch", "error", f"{source['id']} status={status}")
-                    continue
+                # Emitted before the fetch so a source that hangs or dies
+                # mid-fetch still leaves a trace: if "start" appears with
+                # no matching "ok"/"error"/"rate_limited"/"unparseable"
+                # line before the next cycle's "start" for the same
+                # source, that source's fetch/parse step raised something
+                # not caught below (or is still blocked).
+                log("source.fetch", "start", source["id"])
 
                 try:
-                    html_text = body.decode("utf-8", errors="replace")
+                    status, body, fetch_status = fetch(source["url"])
+
+                    if fetch_status == "rate_limited":
+                        log("source.fetch", "rate_limited", source["id"])
+                        continue
+                    if fetch_status != "ok" or body is None:
+                        log("source.fetch", "error", f"{source['id']} status={status}")
+                        continue
+
+                    try:
+                        html_text = body.decode("utf-8", errors="replace")
+                    except Exception as e:
+                        log("source.fetch", "decode_error", f"{source['id']} {e}")
+                        continue
+
+                    result = process_fetch_result(source["id"], source["kind"], html_text, seen_tweet_ids, cfg)
+
+                    if result is None:
+                        log("source.fetch", "unparseable", f"{source['id']} (challenge page or structure mismatch)")
+                    else:
+                        log("source.fetch", "ok", f"{source['id']} new_posts={result}")
+
                 except Exception as e:
-                    log("source.fetch", "decode_error", f"{source['id']} {e}")
-                    continue
-
-                result = process_fetch_result(source["id"], source["kind"], html_text, seen_tweet_ids, cfg)
-
-                if result is None:
-                    log("source.fetch", "unparseable", f"{source['id']} (challenge page or structure mismatch)")
-                else:
-                    log("source.fetch", "ok", f"{source['id']} new_posts={result}")
+                    # Broad catch by design: a single source's unexpected
+                    # failure (e.g. a bare TimeoutError not wrapped in
+                    # URLError, or any other exception the fetch/parse
+                    # path did not anticipate) must not silently kill the
+                    # collector thread and take the other two sources
+                    # down with it for the rest of the process lifetime.
+                    log("source.fetch", "unexpected_error", f"{source['id']} {e!r}")
 
             elapsed = time.monotonic() - cycle_start
             remaining = 60 - elapsed
