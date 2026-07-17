@@ -42,6 +42,25 @@ Fixes applied vs. prior revision:
      direct posts and mis-attributed to whichever nitter mirror fetched
      them. Content is now the deciding signal in addition to the DOM
      marker and username check.
+  3. Muskmeter retweet extraction previously trusted the numeric ID
+     embedded in the `/elonmusk/status/<id>` anchor as the sole dedup
+     key. In practice Muskmeter has been observed to occasionally
+     render the same underlying retweet event under two different
+     anchor IDs within the same page fetch (or across two fetches
+     moments apart), which produced two CSV rows and two notifications
+     for what is, to a human reader, "the same retweet" -- same
+     content, timestamps within a few tens of seconds of each other
+     (the synthetic even-spacing timestamp is itself unstable between
+     fetches, since it depends on page_order and now_utc, both of
+     which can shift cycle-to-cycle for a retweet that remains visible
+     across multiple polls). A secondary dedup pass has been added
+     that, for retweet-type items only, suppresses a new item if its
+     normalized content exactly matches a retweet already present in
+     the CSV within RETWEET_DUP_WINDOW_SECONDS of its synthetic
+     timestamp. This runs in addition to (not instead of) the existing
+     ID-based dedup, and is logged distinctly
+     ("duplicate_content_suppressed") so a recurrence is immediately
+     attributable to this path rather than requiring re-investigation.
 """
 
 import re
@@ -61,6 +80,14 @@ TARGET_USER = "elonmusk"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
 TIMEOUT_SECONDS = 15
+
+# Content-level dedup tolerance for retweet-type items. See fix note #3
+# in the module docstring. This is deliberately wider than the 60s
+# muskmeter bucket width, because the synthetic even-spacing timestamp
+# assigned to a given retweet is not stable across fetch cycles (it
+# depends on now_utc and the item's page_order, both of which can shift
+# while the retweet is still visible on muskmeter's page across polls).
+RETWEET_DUP_WINDOW_SECONDS = 90
 
 SOURCES = [
     {"id": "nitter.kareem.one", "kind": "nitter_direct",
@@ -118,6 +145,20 @@ def format_datetime_est_from_utc(dt_utc):
     date_str = est_dt.strftime("%-m/%-d/%Y")
     time_str = est_dt.strftime("%-I:%M:%S %p")
     return at_str, date_str, time_str
+
+
+def parse_posted_at_est_to_utc(posted_at_str):
+    """Inverse of format_datetime_est_from_utc's 'at_str' field. Returns
+    an aware UTC datetime, or None if the string cannot be parsed. Used
+    only by the content-dedup pass to compare a candidate new item's
+    synthetic timestamp against timestamps already recorded in the CSV."""
+    if not posted_at_str:
+        return None
+    try:
+        naive = datetime.strptime(posted_at_str.strip(), "%m/%d/%Y, %I:%M:%S %p")
+    except ValueError:
+        return None
+    return naive.replace(tzinfo=EASTERN).astimezone(timezone.utc)
 
 
 def is_challenge_page(text_lower):
@@ -312,7 +353,17 @@ def parse_muskmeter_relative_time(relative_time, now_utc):
 def extract_retweets_muskmeter(html_content, now_utc):
     """Returns retweet-only dicts: id, content, bucket_start, page_order
     (0 = most recent, i.e. topmost on page). Direct posts (no rt-text
-    block) are skipped -- Nitter owns those."""
+    block) are skipped -- Nitter owns those.
+
+    Note: Muskmeter has been observed to occasionally emit two distinct
+    anchor elements (and therefore two distinct tweet_id values under
+    this regex) for what is the same underlying retweet event. That
+    cannot be fixed at parse time, since both anchors are syntactically
+    valid and there is no reliable way to know from the HTML alone which
+    ID (if either) is "canonical." It is instead handled downstream in
+    process_fetch_result via a content+timestamp dedup pass -- see
+    RETWEET_DUP_WINDOW_SECONDS and its usage below.
+    """
     retweets = []
     for page_order, match in enumerate(MUSKMETER_TWEET_RE.finditer(html_content)):
         tweet_id = match.group(1)
@@ -377,6 +428,60 @@ def parse_muskmeter_retweets(html_text, now_utc):
 
 
 # ---------------------------------------------------------------------------
+# Content-level dedup for retweets (see fix note #3 in module docstring)
+# ---------------------------------------------------------------------------
+
+def _normalize_content_for_dedup(content):
+    return re.sub(r'\s+', ' ', (content or "")).strip().lower()
+
+
+def build_existing_retweet_index(existing_rows, header_index):
+    """Scans the existing CSV rows once and returns a list of
+    (normalized_content, posted_at_utc) tuples for rows that look like
+    retweets (content starting with 'RT @', matching the convention used
+    elsewhere in this codebase for retweet text). Rows whose posted-at
+    field cannot be parsed are skipped (cannot be time-compared, so they
+    cannot participate in the dedup window check; this is intentionally
+    conservative -- it only ever suppresses items it can positively
+    confirm are duplicates, never suppresses on missing data)."""
+    content_col = header_index.get("Content")
+    posted_col = header_index.get("Posted At (EST)")
+    if content_col is None or posted_col is None:
+        return []
+
+    index = []
+    for row in existing_rows:
+        if len(row) <= max(content_col, posted_col):
+            continue
+        raw_content = row[content_col]
+        if not RT_PREFIX_RE.match(raw_content or ""):
+            continue
+        posted_utc = parse_posted_at_est_to_utc(row[posted_col])
+        if posted_utc is None:
+            continue
+        index.append((_normalize_content_for_dedup(raw_content), posted_utc))
+    return index
+
+
+def find_content_duplicate(candidate_content, candidate_posted_utc, existing_index,
+                            window_seconds=RETWEET_DUP_WINDOW_SECONDS):
+    """Returns True if candidate matches (same normalized content, posted
+    time within window_seconds) an entry already in existing_index."""
+    if candidate_posted_utc is None:
+        return False
+    norm_candidate = _normalize_content_for_dedup(candidate_content)
+    if not norm_candidate:
+        return False
+    for existing_content, existing_posted_utc in existing_index:
+        if existing_content != norm_candidate:
+            continue
+        delta = abs((candidate_posted_utc - existing_posted_utc).total_seconds())
+        if delta <= window_seconds:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -404,13 +509,60 @@ def process_fetch_result(source_id, kind, html_text, seen_tweet_ids, cfg):
         return 0
 
     try:
-        _header, existing_rows, _sha = read_csv_rows()
+        header, existing_rows, _sha = read_csv_rows()
         existing_ids = {row[0] for row in existing_rows if row}
         seen_tweet_ids.update(existing_ids)
     except RuntimeError:
-        pass
+        header, existing_rows = None, []
 
     new_items = [t for t in new_items if t["id"] not in seen_tweet_ids]
+    if not new_items:
+        return 0
+
+    # Secondary dedup: content+time match against retweets already on
+    # record, independent of the (possibly-duplicated) tweet_id. Only
+    # applies to type == "retweet" items, since that is the only path
+    # observed to emit two distinct IDs for one real event; direct posts
+    # from Nitter carry an exact, source-verified timestamp and ID and
+    # are not subject to this check.
+    if kind == "muskmeter_retweets" and header is not None:
+        header_index = {name: i for i, name in enumerate(header)}
+        existing_retweet_index = build_existing_retweet_index(existing_rows, header_index)
+
+        surviving_items = []
+        suppressed_count = 0
+        for t in new_items:
+            if t.get("type") == "retweet" and find_content_duplicate(
+                t["content"], t["posted_datetime"], existing_retweet_index
+            ):
+                suppressed_count += 1
+                log(
+                    "dedup.content",
+                    "duplicate_content_suppressed",
+                    f"source={source_id} id={t['id']} "
+                    f"posted={t['posted_datetime'].isoformat()} "
+                    f"content={t['content'][:80]!r}",
+                )
+                # Mark as seen so it does not get re-suppressed-then-
+                # re-logged every remaining cycle it stays on the page;
+                # it will also naturally match on tweet_id from here on
+                # once/if it ever legitimately lands in the CSV under
+                # this same ID via another path.
+                seen_tweet_ids.add(t["id"])
+            else:
+                surviving_items.append(t)
+                # Extend the in-memory index too, so that if muskmeter's
+                # own page contains this exact duplicate twice within the
+                # *same* fetch (both as "new" relative to the CSV), the
+                # second occurrence is caught against the first rather
+                # than both slipping through together.
+                existing_retweet_index.append(
+                    (_normalize_content_for_dedup(t["content"]), t["posted_datetime"])
+                )
+        new_items = surviving_items
+        if suppressed_count:
+            log("dedup.content", "summary", f"source={source_id} suppressed={suppressed_count}")
+
     if not new_items:
         return 0
 
